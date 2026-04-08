@@ -8,13 +8,98 @@ from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 
-import orjson
-
+import requests as _requests
 from openai import OpenAI
 
-from client import LeakHunterEnv
-from models import LeakHunterAction, LeakHunterObservation, LeakHunterState, ResetObservation, RewardBreakdown
-from server.trace_models import AgentFrame, EpisodeTrace, TraceFrame, TraceMeta, TraceTerminal, TraceTopology
+# ── Self-contained fallbacks ────────────────────────────────────────────────
+# The hackathon validator runs inference.py in isolation (/tmp/workspace/)
+# without client.py, models.py, or server/. These fallbacks let inference.py
+# work standalone with just openai + requests.
+
+try:
+    from client import LeakHunterEnv
+    from models import LeakHunterAction
+except ImportError:
+
+    @dataclass
+    class LeakHunterAction:  # type: ignore[no-redef]
+        action_type: str
+        target_id: str
+        method: str | None = None
+
+        def model_dump(self):
+            return {"action_type": self.action_type, "target_id": self.target_id, "method": self.method}
+
+        def as_command(self):
+            if self.action_type == "repair":
+                return f"repair {self.target_id} {self.method}"
+            return f"{self.action_type} {self.target_id}"
+
+    class _Obs:
+        def __init__(self, data: dict):
+            self.text = data.get("text", "")
+            self.done = data.get("done", False)
+            self.summary_text = data.get("summary_text")
+            self.sensor_readings = data.get("sensor_readings", [])
+            self.alerts = data.get("alerts", [])
+            self.reward_breakdown = data.get("reward_breakdown")
+
+    class _StepResult:
+        def __init__(self, observation, reward, done):
+            self.observation = observation
+            self.reward = reward
+            self.done = done
+
+    class _State:
+        def __init__(self, data: dict):
+            self.final_score = data.get("final_score")
+            self.step_count = data.get("step_count", 0)
+            self.episode_id = data.get("episode_id")
+            self.last_message = data.get("last_message")
+            self.forced_repair = data.get("forced_repair", False)
+
+    class LeakHunterEnv:  # type: ignore[no-redef]
+        def __init__(self, base_url="http://localhost:8000", timeout=30.0):
+            self.base_url = base_url.rstrip("/")
+            self.timeout = timeout
+            self._session = _requests.Session()
+
+        def reset(self, difficulty="easy", seed=None):
+            payload: dict = {"difficulty": difficulty}
+            if seed is not None:
+                payload["seed"] = seed
+            resp = self._session.post(f"{self.base_url}/reset", json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+            return _Obs(resp.json()["observation"])
+
+        def step(self, action):
+            resp = self._session.post(
+                f"{self.base_url}/step", json={"action": action.model_dump()}, timeout=self.timeout
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return _StepResult(
+                observation=_Obs(data["observation"]),
+                reward=data.get("reward"),
+                done=bool(data.get("done", False)),
+            )
+
+        def state(self):
+            resp = self._session.get(f"{self.base_url}/state", timeout=self.timeout)
+            resp.raise_for_status()
+            return _State(resp.json())
+
+        def close(self):
+            self._session.close()
+
+# Trace-related imports — only needed when --trace is used inside Docker.
+try:
+    import orjson
+    from models import LeakHunterObservation, LeakHunterState, ResetObservation, RewardBreakdown
+    from server.trace_models import AgentFrame, EpisodeTrace, TraceFrame, TraceMeta, TraceTerminal, TraceTopology
+    _TRACE_AVAILABLE = True
+except ImportError:
+    _TRACE_AVAILABLE = False
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4.1-mini")
@@ -93,121 +178,124 @@ class RunResult:
     final_message: str
 
 
-class ClientTraceRecorder:
-    def __init__(
-        self,
-        trace_dir: str = "traces",
-        agent_model: str | None = None,
-        agent_name: str | None = "llm",
-    ) -> None:
-        self._trace_dir = Path(trace_dir)
-        self._trace_dir.mkdir(parents=True, exist_ok=True)
-        self._agent_model = agent_model
-        self._agent_name = agent_name
-        self._trace: EpisodeTrace | None = None
-        self._trace_path: Path | None = None
-        self._pending_agent_frame: AgentFrame | None = None
-        self._finalized = False
+if _TRACE_AVAILABLE:
+    class ClientTraceRecorder:
+        def __init__(
+            self,
+            trace_dir: str = "traces",
+            agent_model: str | None = None,
+            agent_name: str | None = "llm",
+        ) -> None:
+            self._trace_dir = Path(trace_dir)
+            self._trace_dir.mkdir(parents=True, exist_ok=True)
+            self._agent_model = agent_model
+            self._agent_name = agent_name
+            self._trace: EpisodeTrace | None = None
+            self._trace_path: Path | None = None
+            self._pending_agent_frame: AgentFrame | None = None
+            self._finalized = False
 
-    def record_reset(
-        self, reset_obs: ResetObservation, state: LeakHunterState, difficulty: str, seed: int
-    ) -> None:
-        episode_id = state.episode_id or f"{difficulty}_{seed}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
-        self._trace = EpisodeTrace(
-            meta=TraceMeta(
-                episode_id=episode_id,
-                difficulty=difficulty,
-                seed=seed,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                agent_model=self._agent_model,
-                agent_name=self._agent_name,
-            ),
-            topology=TraceTopology(
-                nodes=list(reset_obs.nodes),
-                pipes=list(reset_obs.pipes),
-                sections=list(reset_obs.sections),
-                zones=list(reset_obs.zones),
-            ),
-            frames=[
+        def record_reset(
+            self, reset_obs: ResetObservation, state: LeakHunterState, difficulty: str, seed: int
+        ) -> None:
+            episode_id = state.episode_id or f"{difficulty}_{seed}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+            self._trace = EpisodeTrace(
+                meta=TraceMeta(
+                    episode_id=episode_id,
+                    difficulty=difficulty,
+                    seed=seed,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    agent_model=self._agent_model,
+                    agent_name=self._agent_name,
+                ),
+                topology=TraceTopology(
+                    nodes=list(reset_obs.nodes),
+                    pipes=list(reset_obs.pipes),
+                    sections=list(reset_obs.sections),
+                    zones=list(reset_obs.zones),
+                ),
+                frames=[
+                    TraceFrame(
+                        step_index=0,
+                        kind="reset",
+                        action=None,
+                        observation=reset_obs,
+                        state=state,
+                        public_readings=list(reset_obs.sensor_readings),
+                        alerts=list(reset_obs.alerts),
+                        hidden=None,
+                        agent=None,
+                    )
+                ],
+            )
+            self._trace_path = self._trace_dir / f"{episode_id}.client.trace.json"
+            self._finalized = False
+            self._pending_agent_frame = None
+
+        def set_agent_frame(self, agent_frame: AgentFrame) -> None:
+            self._pending_agent_frame = agent_frame
+
+        def record_step(
+            self, action: LeakHunterAction, obs: LeakHunterObservation, state: LeakHunterState
+        ) -> None:
+            if self._trace is None:
+                raise RuntimeError("ClientTraceRecorder.record_reset() must be called first")
+
+            kind = "terminal" if obs.done else "step"
+            self._trace.frames.append(
                 TraceFrame(
-                    step_index=0,
-                    kind="reset",
-                    action=None,
-                    observation=reset_obs,
+                    step_index=state.step_count,
+                    kind=kind,
+                    action=action,
+                    observation=obs,
                     state=state,
-                    public_readings=list(reset_obs.sensor_readings),
-                    alerts=list(reset_obs.alerts),
+                    public_readings=list(obs.sensor_readings),
+                    alerts=list(obs.alerts),
                     hidden=None,
-                    agent=None,
+                    agent=self._consume_agent_frame(),
                 )
-            ],
-        )
-        self._trace_path = self._trace_dir / f"{episode_id}.client.trace.json"
-        self._finalized = False
-        self._pending_agent_frame = None
-
-    def set_agent_frame(self, agent_frame: AgentFrame) -> None:
-        self._pending_agent_frame = agent_frame
-
-    def record_step(
-        self, action: LeakHunterAction, obs: LeakHunterObservation, state: LeakHunterState
-    ) -> None:
-        if self._trace is None:
-            raise RuntimeError("ClientTraceRecorder.record_reset() must be called first")
-
-        kind = "terminal" if obs.done else "step"
-        self._trace.frames.append(
-            TraceFrame(
-                step_index=state.step_count,
-                kind=kind,
-                action=action,
-                observation=obs,
-                state=state,
-                public_readings=list(obs.sensor_readings),
-                alerts=list(obs.alerts),
-                hidden=None,
-                agent=self._consume_agent_frame(),
             )
-        )
-        if obs.done:
-            repair_target, repair_method = self._extract_repair_details(
-                state.last_message or ""
-            )
-            breakdown = obs.reward_breakdown or RewardBreakdown(
-                final_score=float(state.final_score or 0.0)
-            )
-            self._trace.terminal = TraceTerminal(
-                final_score=float(state.final_score or breakdown.final_score or 0.0),
-                forced_repair=state.forced_repair,
-                reward_breakdown=breakdown,
-                true_leak_pipe_id="unknown",
-                true_leak_section_id="unknown",
-                repair_target=repair_target,
-                repair_method=repair_method,
-            )
-            self.finalize()
+            if obs.done:
+                repair_target, repair_method = self._extract_repair_details(
+                    state.last_message or ""
+                )
+                breakdown = obs.reward_breakdown or RewardBreakdown(
+                    final_score=float(state.final_score or 0.0)
+                )
+                self._trace.terminal = TraceTerminal(
+                    final_score=float(state.final_score or breakdown.final_score or 0.0),
+                    forced_repair=state.forced_repair,
+                    reward_breakdown=breakdown,
+                    true_leak_pipe_id="unknown",
+                    true_leak_section_id="unknown",
+                    repair_target=repair_target,
+                    repair_method=repair_method,
+                )
+                self.finalize()
 
-    def finalize(self) -> None:
-        if self._finalized or self._trace is None or self._trace_path is None:
-            return
-        with self._trace_path.open("wb") as f:
-            f.write(orjson.dumps(self._trace.model_dump(mode="json"), option=orjson.OPT_INDENT_2))
-            f.write(b"\n")
-        self._finalized = True
+        def finalize(self) -> None:
+            if self._finalized or self._trace is None or self._trace_path is None:
+                return
+            with self._trace_path.open("wb") as f:
+                f.write(orjson.dumps(self._trace.model_dump(mode="json"), option=orjson.OPT_INDENT_2))
+                f.write(b"\n")
+            self._finalized = True
 
-    def _consume_agent_frame(self) -> AgentFrame | None:
-        agent_frame = self._pending_agent_frame
-        self._pending_agent_frame = None
-        return agent_frame
+        def _consume_agent_frame(self) -> AgentFrame | None:
+            agent_frame = self._pending_agent_frame
+            self._pending_agent_frame = None
+            return agent_frame
 
-    def _extract_repair_details(self, message: str) -> tuple[str | None, str | None]:
-        match = re.search(
-            r"\brepair=([A-Z][A-Za-z0-9]*)\s+(clamp_pipe|replace_section|isolate_section)\b",
-            message,
-        )
-        if match is None:
-            return (None, None)
-        return (match.group(1), match.group(2))
+        def _extract_repair_details(self, message: str) -> tuple[str | None, str | None]:
+            match = re.search(
+                r"\brepair=([A-Z][A-Za-z0-9]*)\s+(clamp_pipe|replace_section|isolate_section)\b",
+                message,
+            )
+            if match is None:
+                return (None, None)
+            return (match.group(1), match.group(2))
+else:
+    ClientTraceRecorder = None  # type: ignore[assignment,misc]
 
 
 def parse_action(text: str, default_target: str = "N01") -> LeakHunterAction:
@@ -299,7 +387,7 @@ def run_episode(
     difficulty: str,
     seed: int,
     max_steps: int = 32,
-    trace_recorder: ClientTraceRecorder | None = None,
+    trace_recorder: object | None = None,
     model_name: str | None = None,
 ) -> RunResult:
     model_name = model_name or MODEL_NAME
@@ -400,7 +488,7 @@ def run_episode(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--base-url", default=os.getenv("LEAKHUNTER_URL", "http://localhost:8000"))
     parser.add_argument("--seeds", type=int, nargs="*", default=[11, 22, 33])
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--trace-dir", default="traces")
@@ -413,15 +501,16 @@ def main() -> None:
     rows: list[RunResult] = []
     for difficulty in ("easy", "medium", "hard"):
         for seed in args.seeds:
-            trace_recorder = (
-                ClientTraceRecorder(
-                    trace_dir=args.trace_dir,
-                    agent_model=MODEL_NAME,
-                    agent_name="llm",
-                )
-                if args.trace
-                else None
-            )
+            trace_recorder = None
+            if args.trace:
+                if not _TRACE_AVAILABLE:
+                    print("Warning: --trace requires the full leakhunter package; skipping.", flush=True)
+                else:
+                    trace_recorder = ClientTraceRecorder(
+                        trace_dir=args.trace_dir,
+                        agent_model=MODEL_NAME,
+                        agent_name="llm",
+                    )
             rows.append(
                 run_episode(
                     env,
