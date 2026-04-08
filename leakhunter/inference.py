@@ -4,15 +4,45 @@ import argparse
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from time import perf_counter
+
+import orjson
 
 from openai import OpenAI
 
 from client import LeakHunterEnv
-from models import LeakHunterAction
+from models import LeakHunterAction, LeakHunterObservation, LeakHunterState, ResetObservation, RewardBreakdown
+from server.trace_models import AgentFrame, EpisodeTrace, TraceFrame, TraceMeta, TraceTerminal, TraceTopology
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4.1-mini")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or ""
+BENCHMARK = "leakhunter"
+
+
+# ── Mandatory stdout logging ([START], [STEP], [END]) ──────────────────────
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: str | None) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: list[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
 
 SYSTEM_PROMPT = """You are LeakHunter, a hydraulic field investigator.
 
@@ -61,6 +91,123 @@ class RunResult:
     final_score: float
     steps: int
     final_message: str
+
+
+class ClientTraceRecorder:
+    def __init__(
+        self,
+        trace_dir: str = "traces",
+        agent_model: str | None = None,
+        agent_name: str | None = "llm",
+    ) -> None:
+        self._trace_dir = Path(trace_dir)
+        self._trace_dir.mkdir(parents=True, exist_ok=True)
+        self._agent_model = agent_model
+        self._agent_name = agent_name
+        self._trace: EpisodeTrace | None = None
+        self._trace_path: Path | None = None
+        self._pending_agent_frame: AgentFrame | None = None
+        self._finalized = False
+
+    def record_reset(
+        self, reset_obs: ResetObservation, state: LeakHunterState, difficulty: str, seed: int
+    ) -> None:
+        episode_id = state.episode_id or f"{difficulty}_{seed}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+        self._trace = EpisodeTrace(
+            meta=TraceMeta(
+                episode_id=episode_id,
+                difficulty=difficulty,
+                seed=seed,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                agent_model=self._agent_model,
+                agent_name=self._agent_name,
+            ),
+            topology=TraceTopology(
+                nodes=list(reset_obs.nodes),
+                pipes=list(reset_obs.pipes),
+                sections=list(reset_obs.sections),
+                zones=list(reset_obs.zones),
+            ),
+            frames=[
+                TraceFrame(
+                    step_index=0,
+                    kind="reset",
+                    action=None,
+                    observation=reset_obs,
+                    state=state,
+                    public_readings=list(reset_obs.sensor_readings),
+                    alerts=list(reset_obs.alerts),
+                    hidden=None,
+                    agent=None,
+                )
+            ],
+        )
+        self._trace_path = self._trace_dir / f"{episode_id}.client.trace.json"
+        self._finalized = False
+        self._pending_agent_frame = None
+
+    def set_agent_frame(self, agent_frame: AgentFrame) -> None:
+        self._pending_agent_frame = agent_frame
+
+    def record_step(
+        self, action: LeakHunterAction, obs: LeakHunterObservation, state: LeakHunterState
+    ) -> None:
+        if self._trace is None:
+            raise RuntimeError("ClientTraceRecorder.record_reset() must be called first")
+
+        kind = "terminal" if obs.done else "step"
+        self._trace.frames.append(
+            TraceFrame(
+                step_index=state.step_count,
+                kind=kind,
+                action=action,
+                observation=obs,
+                state=state,
+                public_readings=list(obs.sensor_readings),
+                alerts=list(obs.alerts),
+                hidden=None,
+                agent=self._consume_agent_frame(),
+            )
+        )
+        if obs.done:
+            repair_target, repair_method = self._extract_repair_details(
+                state.last_message or ""
+            )
+            breakdown = obs.reward_breakdown or RewardBreakdown(
+                final_score=float(state.final_score or 0.0)
+            )
+            self._trace.terminal = TraceTerminal(
+                final_score=float(state.final_score or breakdown.final_score or 0.0),
+                forced_repair=state.forced_repair,
+                reward_breakdown=breakdown,
+                true_leak_pipe_id="unknown",
+                true_leak_section_id="unknown",
+                repair_target=repair_target,
+                repair_method=repair_method,
+            )
+            self.finalize()
+
+    def finalize(self) -> None:
+        if self._finalized or self._trace is None or self._trace_path is None:
+            return
+        with self._trace_path.open("wb") as f:
+            f.write(orjson.dumps(self._trace.model_dump(mode="json"), option=orjson.OPT_INDENT_2))
+            f.write(b"\n")
+        self._finalized = True
+
+    def _consume_agent_frame(self) -> AgentFrame | None:
+        agent_frame = self._pending_agent_frame
+        self._pending_agent_frame = None
+        return agent_frame
+
+    def _extract_repair_details(self, message: str) -> tuple[str | None, str | None]:
+        match = re.search(
+            r"\brepair=([A-Z][A-Za-z0-9]*)\s+(clamp_pipe|replace_section|isolate_section)\b",
+            message,
+        )
+        if match is None:
+            return (None, None)
+        return (match.group(1), match.group(2))
 
 
 def parse_action(text: str, default_target: str = "N01") -> LeakHunterAction:
@@ -152,25 +299,69 @@ def run_episode(
     difficulty: str,
     seed: int,
     max_steps: int = 32,
+    trace_recorder: ClientTraceRecorder | None = None,
+    model_name: str | None = None,
 ) -> RunResult:
+    model_name = model_name or MODEL_NAME
     obs = client.reset(difficulty=difficulty, seed=seed)
+    state = client.state()
+    if trace_recorder is not None:
+        trace_recorder.record_reset(obs, state, difficulty, seed)
     default_target = choose_default_target(obs.text)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": obs.text},
     ]
+
+    task_name = f"{difficulty}-seed{seed}"
+    log_start(task=task_name, env=BENCHMARK, model=model_name)
+
+    step_rewards: list[float] = []
+    step_count = 0
     final_obs = None
-    for _ in range(max_steps):
+    for step_num in range(1, max_steps + 1):
+        started_at = perf_counter()
         response = llm.chat.completions.create(
-            model=MODEL_NAME,
+            model=model_name,
             messages=messages,
             temperature=0.1,
-            max_tokens=512,
+            max_tokens=4096,
         )
-        assistant_text = response.choices[0].message.content or ""
+        latency_ms = (perf_counter() - started_at) * 1000.0
+        msg = response.choices[0].message
+        assistant_text = msg.content or ""
+        # Capture thinking/reasoning tokens from thinking models (e.g. Qwen 3.5)
+        reasoning_text = getattr(msg, "reasoning", None) or ""
+        if not reasoning_text and hasattr(msg, "model_extra") and msg.model_extra:
+            reasoning_text = msg.model_extra.get("reasoning", "") or ""
         action = parse_action(assistant_text, default_target=default_target)
+        if trace_recorder is not None:
+            trace_recorder.set_agent_frame(
+                AgentFrame(
+                    raw_output=assistant_text,
+                    reasoning=reasoning_text or None,
+                    parsed_action=action.as_command(),
+                    model_name=model_name,
+                    latency_ms=latency_ms,
+                )
+            )
         step = client.step(action)
         final_obs = step.observation
+        state = client.state()
+        step_count = step_num
+        reward = float(step.reward or 0.0)
+        step_rewards.append(reward)
+
+        log_step(
+            step=step_num,
+            action=action.as_command(),
+            reward=reward,
+            done=step.done,
+            error=None,
+        )
+
+        if trace_recorder is not None:
+            trace_recorder.record_step(action, final_obs, state)
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": final_obs.text})
         # summary injection every time environment provides one
@@ -185,11 +376,23 @@ def run_episode(
             ]
         if step.done:
             break
-    state = client.state()
+    if trace_recorder is not None:
+        trace_recorder.finalize()
+
+    final_score = float(state.final_score or 0.0)
+    success = final_score >= 0.35  # "decent" band threshold
+
+    log_end(
+        success=success,
+        steps=step_count,
+        score=final_score,
+        rewards=step_rewards,
+    )
+
     return RunResult(
         difficulty=difficulty,
         seed=seed,
-        final_score=float(state.final_score or 0.0),
+        final_score=final_score,
         steps=state.step_count,
         final_message=state.last_message or "",
     )
@@ -199,6 +402,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--seeds", type=int, nargs="*", default=[11, 22, 33])
+    parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--trace-dir", default="traces")
     args = parser.parse_args()
 
     api_key = API_KEY or "ollama"
@@ -208,7 +413,24 @@ def main() -> None:
     rows: list[RunResult] = []
     for difficulty in ("easy", "medium", "hard"):
         for seed in args.seeds:
-            rows.append(run_episode(env, llm, difficulty, seed))
+            trace_recorder = (
+                ClientTraceRecorder(
+                    trace_dir=args.trace_dir,
+                    agent_model=MODEL_NAME,
+                    agent_name="llm",
+                )
+                if args.trace
+                else None
+            )
+            rows.append(
+                run_episode(
+                    env,
+                    llm,
+                    difficulty,
+                    seed,
+                    trace_recorder=trace_recorder,
+                )
+            )
 
     print("\nLeakHunter baseline results")
     print("=" * 60)

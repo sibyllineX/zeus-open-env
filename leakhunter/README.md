@@ -7,6 +7,7 @@ sdk: docker
 app_port: 8000
 pinned: false
 license: mit
+base_path: /web
 ---
 
 # LeakHunter
