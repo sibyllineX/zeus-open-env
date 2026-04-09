@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 
 import requests as _requests
 from openai import OpenAI
@@ -407,75 +408,86 @@ def run_episode(
     step_rewards: list[float] = []
     step_count = 0
     final_obs = None
-    for step_num in range(1, max_steps + 1):
-        started_at = perf_counter()
-        response = llm.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            temperature=0.1,
-            max_tokens=4096,
-        )
-        latency_ms = (perf_counter() - started_at) * 1000.0
-        msg = response.choices[0].message
-        assistant_text = msg.content or ""
-        # Capture thinking/reasoning tokens from thinking models (e.g. Qwen 3.5)
-        reasoning_text = getattr(msg, "reasoning", None) or ""
-        if not reasoning_text and hasattr(msg, "model_extra") and msg.model_extra:
-            reasoning_text = msg.model_extra.get("reasoning", "") or ""
-        action = parse_action(assistant_text, default_target=default_target)
-        if trace_recorder is not None:
-            trace_recorder.set_agent_frame(
-                AgentFrame(
-                    raw_output=assistant_text,
-                    reasoning=reasoning_text or None,
-                    parsed_action=action.as_command(),
-                    model_name=model_name,
-                    latency_ms=latency_ms,
+    final_score = 0.0
+    try:
+        for step_num in range(1, max_steps + 1):
+            started_at = perf_counter()
+            for _retry in range(3):
+                try:
+                    response = llm.chat.completions.create(
+                        model=model_name,
+                        messages=messages,
+                        temperature=0.1,
+                        max_tokens=4096,
+                    )
+                    break
+                except Exception as llm_err:
+                    if _retry == 2:
+                        raise
+                    print(f"[WARN] LLM call failed (attempt {_retry+1}/3): {llm_err}", flush=True)
+                    sleep(2 ** _retry)
+            latency_ms = (perf_counter() - started_at) * 1000.0
+            msg = response.choices[0].message
+            assistant_text = msg.content or ""
+            # Capture thinking/reasoning tokens from thinking models (e.g. Qwen 3.5)
+            reasoning_text = getattr(msg, "reasoning", None) or ""
+            if not reasoning_text and hasattr(msg, "model_extra") and msg.model_extra:
+                reasoning_text = msg.model_extra.get("reasoning", "") or ""
+            action = parse_action(assistant_text, default_target=default_target)
+            if trace_recorder is not None:
+                trace_recorder.set_agent_frame(
+                    AgentFrame(
+                        raw_output=assistant_text,
+                        reasoning=reasoning_text or None,
+                        parsed_action=action.as_command(),
+                        model_name=model_name,
+                        latency_ms=latency_ms,
+                    )
                 )
+            step = client.step(action)
+            final_obs = step.observation
+            state = client.state()
+            step_count = step_num
+            reward = float(step.reward or 0.0)
+            step_rewards.append(reward)
+
+            log_step(
+                step=step_num,
+                action=action.as_command(),
+                reward=reward,
+                done=step.done,
+                error=None,
             )
-        step = client.step(action)
-        final_obs = step.observation
-        state = client.state()
-        step_count = step_num
-        reward = float(step.reward or 0.0)
-        step_rewards.append(reward)
 
-        log_step(
-            step=step_num,
-            action=action.as_command(),
-            reward=reward,
-            done=step.done,
-            error=None,
+            if trace_recorder is not None:
+                trace_recorder.record_step(action, final_obs, state)
+            messages.append({"role": "assistant", "content": assistant_text})
+            messages.append({"role": "user", "content": final_obs.text})
+            # summary injection every time environment provides one
+            if final_obs.summary_text:
+                messages = [
+                    messages[0],
+                    {
+                        "role": "system",
+                        "content": f"Running factual summary:\n{final_obs.summary_text}",
+                    },
+                    *messages[-6:],
+                ]
+            if step.done:
+                break
+
+        final_score = min(max(float(state.final_score or 0.0), 0.0), 1.0)
+    finally:
+        # [END] MUST always be emitted after [START], even on exception
+        success = final_score >= 0.35
+        log_end(
+            success=success,
+            steps=step_count,
+            score=final_score,
+            rewards=step_rewards,
         )
-
         if trace_recorder is not None:
-            trace_recorder.record_step(action, final_obs, state)
-        messages.append({"role": "assistant", "content": assistant_text})
-        messages.append({"role": "user", "content": final_obs.text})
-        # summary injection every time environment provides one
-        if final_obs.summary_text:
-            messages = [
-                messages[0],
-                {
-                    "role": "system",
-                    "content": f"Running factual summary:\n{final_obs.summary_text}",
-                },
-                *messages[-6:],
-            ]
-        if step.done:
-            break
-    if trace_recorder is not None:
-        trace_recorder.finalize()
-
-    final_score = float(state.final_score or 0.0)
-    success = final_score >= 0.35  # "decent" band threshold
-
-    log_end(
-        success=success,
-        steps=step_count,
-        score=final_score,
-        rewards=step_rewards,
-    )
+            trace_recorder.finalize()
 
     return RunResult(
         difficulty=difficulty,
@@ -486,6 +498,28 @@ def run_episode(
     )
 
 
+def _wait_for_server(base_url: str, timeout: float = 120.0, interval: float = 2.0) -> None:
+    """Poll the env server health endpoint until it responds or timeout is reached."""
+    import urllib.request
+    import urllib.error
+
+    health_url = f"{base_url.rstrip('/')}/health"
+    deadline = perf_counter() + timeout
+    attempt = 0
+    while perf_counter() < deadline:
+        attempt += 1
+        try:
+            req = urllib.request.Request(health_url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    print(f"[INFO] Server ready after {attempt} attempt(s)", flush=True)
+                    return
+        except Exception:
+            pass
+        sleep(interval)
+    raise RuntimeError(f"Server at {base_url} did not become healthy within {timeout}s")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default=os.getenv("LEAKHUNTER_URL", "http://localhost:8000"))
@@ -493,6 +527,12 @@ def main() -> None:
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--trace-dir", default="traces")
     args = parser.parse_args()
+
+    # Log configuration for debugging
+    print(f"[INFO] base_url={args.base_url} api_base={API_BASE_URL} model={MODEL_NAME}", flush=True)
+
+    # Wait for the environment server to be ready
+    _wait_for_server(args.base_url)
 
     api_key = API_KEY or "ollama"
     llm = OpenAI(base_url=API_BASE_URL, api_key=api_key)
@@ -511,15 +551,26 @@ def main() -> None:
                         agent_model=MODEL_NAME,
                         agent_name="llm",
                     )
-            rows.append(
-                run_episode(
-                    env,
-                    llm,
-                    difficulty,
-                    seed,
-                    trace_recorder=trace_recorder,
+            try:
+                rows.append(
+                    run_episode(
+                        env,
+                        llm,
+                        difficulty,
+                        seed,
+                        trace_recorder=trace_recorder,
+                    )
                 )
-            )
+            except Exception as exc:
+                print(f"[ERROR] Episode {difficulty}/seed={seed} failed: {exc}", flush=True)
+                traceback.print_exc()
+                rows.append(RunResult(
+                    difficulty=difficulty,
+                    seed=seed,
+                    final_score=0.0,
+                    steps=0,
+                    final_message=f"ERROR: {exc}",
+                ))
 
     print("\nLeakHunter baseline results")
     print("=" * 60)
@@ -536,4 +587,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"[FATAL] Unhandled exception in main: {exc}", flush=True)
+        traceback.print_exc()
+        raise SystemExit(1)
