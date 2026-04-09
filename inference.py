@@ -124,6 +124,7 @@ def log_step(step: int, action: str, reward: float, done: bool, error: str | Non
 
 
 def log_end(success: bool, steps: int, score: float, rewards: list[float]) -> None:
+    score = max(0.01, min(0.99, score))
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
@@ -408,7 +409,7 @@ def run_episode(
     step_rewards: list[float] = []
     step_count = 0
     final_obs = None
-    final_score = 0.0
+    final_score = 0.01
     try:
         for step_num in range(1, max_steps + 1):
             started_at = perf_counter()
@@ -476,7 +477,7 @@ def run_episode(
             if step.done:
                 break
 
-        final_score = min(max(float(state.final_score or 0.0), 0.0), 1.0)
+        final_score = max(0.01, min(0.99, float(state.final_score or 0.01)))
     finally:
         # [END] MUST always be emitted after [START], even on exception
         success = final_score >= 0.35
@@ -567,7 +568,7 @@ def main() -> None:
                 rows.append(RunResult(
                     difficulty=difficulty,
                     seed=seed,
-                    final_score=0.0,
+                    final_score=0.01,
                     steps=0,
                     final_message=f"ERROR: {exc}",
                 ))
