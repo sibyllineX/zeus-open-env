@@ -681,7 +681,7 @@ class LeakHunterEnvironment(Environment):
             + water_component
         )
         final_score = float(
-            np.clip(terminal_component + ctx.cumulative_dense_reward, 0.0, 1.0)
+            np.clip(terminal_component + ctx.cumulative_dense_reward, 0.01, 0.99)
         )
         step_reward = final_score - episode_return_before
 

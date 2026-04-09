@@ -46,7 +46,8 @@ BANDS = {
 
 
 def grade_state(state: LeakHunterState) -> float:
-    return max(0.0, min(1.0, float(state.final_score or 0.0)))
+    raw = float(state.final_score or 0.0)
+    return max(0.01, min(0.99, raw))
 
 
 def classify_score(difficulty: str, score: float) -> str:
